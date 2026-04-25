@@ -4,7 +4,7 @@
 [![RMarkdown](https://img.shields.io/badge/RMarkdown-2.0-75AADB)](https://rmarkdown.rstudio.com/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A self-contained, beginner-friendly R Markdown tutorial covering the complete
+A self-contained, beginner-friendly tutorial covering the complete
 qPCR analysis workflow — from raw Ct values to statistical testing and
 publication-ready figures. **All data are simulated**, so you can run it
 immediately without any experimental data, then swap in your own.
@@ -40,37 +40,6 @@ immediately without any experimental data, then swap in your own.
 Adapt the simulation in **Section 2** to match your own design — change
 `n_samples`, `n_targets`, `groups`, `tissues`, or the effect sizes.
 
----
-
-## Quick Start
-
-```r
-# 1. Clone or download this repo
-# 2. Open qpcr_analysis_tutorial.Rmd in RStudio
-# 3. Click "Knit" — all packages install automatically on first run
-```
-
-Or run programmatically:
-
-```r
-rmarkdown::render("qpcr_analysis_tutorial.Rmd",
-                  output_format = "html_document")
-```
-
----
-
-## Output Files
-
-After knitting, you will have:
-
-- `qpcr_analysis_tutorial.html` — interactive HTML report (open in any browser)
-- `results/delta_ct_normalized.csv` — ΔCt matrix
-- `results/ddct_fold_change.csv` — ΔΔCt and fold change per gene per sample
-- `results/anova_group_effect.csv` — one-way ANOVA results with BH correction
-- `results/anova_interaction.csv` — two-way ANOVA (Group × Tissue)
-- `results/fold_change_summary.csv` — mean fold change per gene
-
----
 
 ## Key Formulas
 
@@ -113,11 +82,6 @@ setup chunk to match your column names.
 
 ## Author
 
-**[Your Name]**  
-[Institution] | [your.email@institution.edu] | [ORCID]
+**Hamed Abdollahi**  
+University of South Carolina| [HPROVAX@gmail.com, HA25@mailbox.sc.edu] | [0000-0002-2202-2193]
 
----
-
-## License
-
-MIT License — see [LICENSE](LICENSE) for details.
