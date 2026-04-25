@@ -1,0 +1,584 @@
+---
+title: "From Raw Ct to Insights: A qPCR Analysis Tutorial in R"
+author: "[Your Name]"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    df_print: paged
+  pdf_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 8,
+  fig.height = 5,
+  dpi     = 150
+)
+```
+
+---
+
+## Overview
+
+This tutorial walks through a complete qPCR analysis pipeline in R — from
+simulated raw Ct values to statistical testing and publication-ready figures.
+
+**What you will learn:**
+
+- Simulate a realistic qPCR dataset
+- Apply ΔCt and ΔΔCt normalization
+- Run one-way and two-way ANOVA with Tukey HSD post-hoc
+- Perform Principal Component Analysis (PCA) on expression data
+- Build violin, boxplot, and interaction plots
+
+**Experimental design used in this tutorial:**
+
+| Factor | Levels |
+|---|---|
+| Group | Control, Treatment |
+| Tissue | TypeA, TypeB |
+| Replicates | 3 per condition |
+| Gene panel | 20 target genes + 1 housekeeping |
+
+All data are **simulated** — safe to adapt for any qPCR experiment.
+
+---
+
+## 1. Setup
+
+```{r packages}
+# Install any missing packages before loading
+required <- c("tidyverse", "ggpubr", "RColorBrewer",
+               "factoextra", "FactoMineR", "corrplot",
+               "patchwork", "ggridges", "viridis", "gt")
+
+to_install <- required[!required %in% rownames(installed.packages())]
+if (length(to_install)) install.packages(to_install)
+
+library(tidyverse)
+library(ggpubr)
+library(RColorBrewer)
+library(factoextra)
+library(FactoMineR)
+library(corrplot)
+library(patchwork)
+library(ggridges)
+library(viridis)
+library(gt)
+```
+
+---
+
+## 2. Simulate qPCR Data
+
+We simulate realistic Ct values for 20 target genes + 1 housekeeping gene
+across two groups (Control / Treatment) and two tissue types (TypeA / TypeB),
+with 3 technical replicates per sample.
+
+```{r simulate-data}
+set.seed(42)
+
+# ── Experimental parameters ──────────────────────────────────────────────────
+n_samples    <- 40        # total biological samples
+n_targets    <- 20        # target genes
+hk_gene      <- "GAPDH"  # housekeeping gene
+groups       <- c("Control", "Treatment")
+tissues      <- c("TypeA", "TypeB")
+n_reps       <- 3         # technical replicates per sample
+
+# ── Gene names ───────────────────────────────────────────────────────────────
+target_genes <- paste0("Gene_", sprintf("%02d", 1:n_targets))
+all_genes    <- c(target_genes, hk_gene)
+
+# ── Sample metadata ──────────────────────────────────────────────────────────
+metadata <- tibble(
+  Sample_ID = paste0("S", sprintf("%02d", 1:n_samples)),
+  Group     = rep(groups,  each = n_samples / 2),
+  Tissue    = rep(tissues, times = n_samples / 2)
+)
+
+# ── Simulate raw Ct values ───────────────────────────────────────────────────
+# Target genes: Ct ~ N(28, 2); Treatment lowers Ct by 1–3 for 8 "responsive" genes
+# Housekeeping: Ct ~ N(18, 0.5) — stable across conditions (by design)
+
+simulate_ct <- function(sample_meta, genes, hk) {
+  map_dfr(1:nrow(sample_meta), function(i) {
+    s <- sample_meta[i, ]
+
+    # 8 genes respond to Treatment (lower Ct = higher expression)
+    responsive  <- paste0("Gene_", sprintf("%02d", 1:8))
+    effect      <- ifelse(s$Group == "Treatment" & genes %in% responsive,
+                          runif(sum(genes %in% responsive), 1, 3), 0)
+
+    # Tissue TypeB adds a small offset for genes 5–12
+    tissue_eff  <- ifelse(s$Tissue == "TypeB" & genes %in% paste0("Gene_", sprintf("%02d", 5:12)),
+                          runif(sum(genes %in% paste0("Gene_", sprintf("%02d", 5:12))), 0.5, 1.5), 0)
+
+    ct_vals <- rnorm(length(genes), mean = 28, sd = 2) - effect - tissue_eff
+    ct_hk   <- rnorm(1, mean = 18, sd = 0.5)
+
+    tibble(
+      Sample_ID = s$Sample_ID,
+      Gene      = c(genes, hk),
+      Ct        = c(ct_vals, ct_hk),
+      Replicate = "mean"   # using mean Ct directly for clarity
+    )
+  })
+}
+
+ct_long <- simulate_ct(metadata, target_genes, hk_gene)
+ct_wide <- ct_long %>%
+  pivot_wider(names_from = Gene, values_from = Ct) %>%
+  left_join(metadata, by = "Sample_ID")
+
+cat("Simulated dataset:", nrow(metadata), "samples ×",
+    length(all_genes), "genes\n")
+glimpse(ct_wide %>% select(Sample_ID, Group, Tissue, Gene_01, Gene_02, GAPDH))
+```
+
+---
+
+## 3. ΔCt Normalization
+
+ΔCt subtracts the housekeeping gene Ct from each target gene Ct within the
+same sample. This corrects for differences in RNA input and cDNA efficiency.
+
+```{r delta-ct}
+# ── Compute ΔCt for every target gene ────────────────────────────────────────
+# ΔCt = Ct_target − Ct_housekeeping
+# Lower ΔCt → higher relative expression
+
+delta_ct <- ct_wide %>%
+  mutate(across(all_of(target_genes),
+                ~ . - GAPDH,
+                .names = "dCt_{.col}")) %>%
+  select(Sample_ID, Group, Tissue,
+         starts_with("dCt_"))
+
+# Rename for clarity: dCt_Gene_01 → Gene_01
+colnames(delta_ct) <- gsub("^dCt_", "", colnames(delta_ct))
+
+cat("ΔCt range across all genes and samples:\n")
+delta_ct %>%
+  pivot_longer(all_of(target_genes), names_to = "Gene", values_to = "dCt") %>%
+  summarise(min = round(min(dCt), 2),
+            mean = round(mean(dCt), 2),
+            max = round(max(dCt), 2)) %>%
+  print()
+```
+
+---
+
+## 4. ΔΔCt and Fold Change
+
+ΔΔCt compares each sample's ΔCt to the mean ΔCt of the reference group
+(here: Control). Fold change = 2^(-ΔΔCt).
+
+```{r ddct}
+# ── Reference: mean ΔCt of Control group per gene ────────────────────────────
+control_means <- delta_ct %>%
+  filter(Group == "Control") %>%
+  summarise(across(all_of(target_genes), mean)) %>%
+  pivot_longer(everything(), names_to = "Gene", values_to = "ref_dCt")
+
+# ── Compute ΔΔCt and fold change ─────────────────────────────────────────────
+ddct_long <- delta_ct %>%
+  pivot_longer(all_of(target_genes),
+               names_to = "Gene", values_to = "dCt") %>%
+  left_join(control_means, by = "Gene") %>%
+  mutate(
+    ddCt       = dCt - ref_dCt,              # ΔΔCt
+    FoldChange = 2^(-ddCt)                   # relative expression
+  )
+
+# Summary: mean fold change per gene per group
+fc_summary <- ddct_long %>%
+  group_by(Gene, Group) %>%
+  summarise(mean_FC = mean(FoldChange), .groups = "drop") %>%
+  pivot_wider(names_from = Group, values_from = mean_FC) %>%
+  mutate(FC_TreatvsControl = round(Treatment / Control, 2)) %>%
+  arrange(desc(FC_TreatvsControl))
+
+cat("Top 5 upregulated genes in Treatment vs Control:\n")
+head(fc_summary, 5)
+```
+
+---
+
+## 5. Descriptive Statistics
+
+```{r descriptives}
+# ── Summary stats: ΔCt by Group × Tissue ─────────────────────────────────────
+dct_stats <- ddct_long %>%
+  group_by(Gene, Group, Tissue) %>%
+  summarise(
+    n      = n(),
+    mean   = round(mean(dCt),   2),
+    sd     = round(sd(dCt),     2),
+    se     = round(sd / sqrt(n), 3),
+    median = round(median(dCt), 2),
+    .groups = "drop"
+  )
+
+# Print a tidy table for the first 5 genes as a preview
+dct_stats %>%
+  filter(Gene %in% paste0("Gene_0", 1:5)) %>%
+  gt() %>%
+  tab_header(title    = "Descriptive statistics — ΔCt",
+             subtitle = "First 5 genes, by Group × Tissue") %>%
+  fmt_number(columns = c(mean, sd, se, median), decimals = 2) %>%
+  tab_style(
+    style = cell_fill(color = "#EAF3DE"),
+    locations = cells_body(rows = Group == "Treatment")
+  )
+```
+
+---
+
+## 6. Statistical Testing
+
+### 6.1 One-Way ANOVA: Group effect
+
+```{r anova-oneway}
+# ── One-way ANOVA: does expression differ by Group? ───────────────────────────
+# Run for every gene; collect F-statistic and p-value
+
+anova_group <- map_dfr(target_genes, function(g) {
+  d   <- delta_ct %>% select(Group, Tissue, value = all_of(g))
+  fit <- aov(value ~ Group, data = d)
+  s   <- summary(fit)[[1]]
+  tibble(Gene    = g,
+         F_value = round(s$`F value`[1], 3),
+         p_value = round(s$`Pr(>F)`[1],  4))
+}) %>%
+  mutate(q_value = round(p.adjust(p_value, method = "BH"), 4),
+         Significant = q_value < 0.05) %>%
+  arrange(p_value)
+
+cat("Significant genes (BH q < 0.05):", sum(anova_group$Significant), "\n")
+head(anova_group, 10)
+```
+
+### 6.2 Two-Way ANOVA: Group × Tissue interaction
+
+```{r anova-twoway}
+# ── Two-way ANOVA: Group × Tissue interaction ─────────────────────────────────
+anova_interaction <- map_dfr(target_genes, function(g) {
+  d   <- delta_ct %>% select(Group, Tissue, value = all_of(g))
+  fit <- aov(value ~ Group * Tissue, data = d)
+  s   <- summary(fit)[[1]]
+  tibble(
+    Gene              = g,
+    F_Group           = round(s$`F value`[1], 3),
+    p_Group           = round(s$`Pr(>F)`[1],  4),
+    F_Tissue          = round(s$`F value`[2], 3),
+    p_Tissue          = round(s$`Pr(>F)`[2],  4),
+    F_Interaction     = round(s$`F value`[3], 3),
+    p_Interaction     = round(s$`Pr(>F)`[3],  4)
+  )
+}) %>%
+  arrange(p_Interaction)
+
+cat("Genes with significant Group × Tissue interaction (p < 0.05):",
+    sum(anova_interaction$p_Interaction < 0.05, na.rm = TRUE), "\n")
+head(anova_interaction, 8)
+```
+
+### 6.3 Tukey HSD Post-Hoc
+
+```{r tukey}
+# ── Tukey HSD for the most significant gene ───────────────────────────────────
+top_gene <- anova_group$Gene[1]
+cat("Running Tukey HSD for:", top_gene, "\n\n")
+
+d_top <- delta_ct %>%
+  mutate(Group_Tissue = interaction(Group, Tissue)) %>%
+  select(Group_Tissue, value = all_of(top_gene))
+
+tukey_fit    <- aov(value ~ Group_Tissue, data = d_top)
+tukey_result <- TukeyHSD(tukey_fit)
+print(tukey_result)
+```
+
+---
+
+## 7. Visualization
+
+### 7.1 Mean ± SE Interaction Plot
+
+```{r plot-interaction, fig.height=5}
+# ── Pooled ΔCt summary across all genes ───────────────────────────────────────
+pooled_summary <- ddct_long %>%
+  group_by(Group, Tissue) %>%
+  summarise(
+    mean = mean(dCt),
+    se   = sd(dCt) / sqrt(n()),
+    .groups = "drop"
+  )
+
+ggplot(pooled_summary,
+       aes(x = factor(Tissue, levels = c("TypeA", "TypeB")),
+           y = mean, color = Group, group = Group)) +
+  geom_point(size = 3.5) +
+  geom_line(linewidth = 0.9) +
+  geom_errorbar(aes(ymin = mean - se, ymax = mean + se), width = 0.12) +
+  scale_color_manual(values = c("Control" = "#1E8449", "Treatment" = "#C0392B")) +
+  labs(x = "Tissue type", y = "Mean ΔCt (pooled across genes)",
+       title = "Group × Tissue interaction",
+       subtitle = "Mean ± SE; lower ΔCt = higher expression") +
+  theme_classic(base_size = 13) +
+  theme(axis.line  = element_line(linewidth = 1),
+        axis.text  = element_text(face = "bold"),
+        axis.title = element_text(face = "bold"),
+        legend.title = element_text(face = "bold"))
+```
+
+### 7.2 Violin + Boxplot per Group
+
+```{r plot-violin, fig.height=5}
+# ── Long-format ΔCt for all genes ────────────────────────────────────────────
+dct_long_plot <- delta_ct %>%
+  pivot_longer(all_of(target_genes),
+               names_to = "Gene", values_to = "dCt")
+
+ggplot(dct_long_plot, aes(x = Tissue, y = dCt, fill = Group)) +
+  geom_violin(alpha = 0.3, position = position_dodge(0.9), scale = "width") +
+  geom_boxplot(width = 0.15, position = position_dodge(0.9),
+               fill  = "white", outlier.size = 0.8) +
+  stat_summary(fun = mean, geom = "point", size = 2,
+               position = position_dodge(0.9), color = "black") +
+  scale_fill_manual(values = c("Control" = "#1E8449", "Treatment" = "#C0392B")) +
+  labs(x = "Tissue type", y = "ΔCt",
+       title = "ΔCt distribution by Group and Tissue",
+       subtitle = "Violin + boxplot + mean point") +
+  theme_minimal(base_size = 13) +
+  theme(axis.text  = element_text(face = "bold"),
+        axis.title = element_text(face = "bold"),
+        legend.title = element_text(face = "bold"))
+```
+
+### 7.3 Volcano-Style Fold Change Plot
+
+```{r plot-volcano, fig.height=6}
+# ── Gene-level fold change vs significance ────────────────────────────────────
+volcano_df <- fc_summary %>%
+  left_join(anova_group %>% select(Gene, q_value), by = "Gene") %>%
+  mutate(
+    log2FC    = log2(FC_TreatvsControl),
+    neg_log10 = -log10(q_value),
+    Status    = case_when(
+      q_value < 0.05 & log2FC >  0.5 ~ "Up",
+      q_value < 0.05 & log2FC < -0.5 ~ "Down",
+      TRUE                            ~ "NS"
+    )
+  )
+
+ggplot(volcano_df, aes(x = log2FC, y = neg_log10, color = Status)) +
+  geom_point(size = 3, alpha = 0.8) +
+  geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed",
+             color = "darkgreen", linewidth = 0.6) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed",
+             color = "red", linewidth = 0.6) +
+  ggrepel::geom_text_repel(
+    data = filter(volcano_df, Status != "NS"),
+    aes(label = Gene), size = 3.5, max.overlaps = 15,
+    fontface = "italic", family = "serif"
+  ) +
+  scale_color_manual(values = c("Up" = "#C0392B", "Down" = "#1565AC", "NS" = "grey60")) +
+  labs(x     = expression(log[2]~"Fold Change (Treatment / Control)"),
+       y     = expression(-log[10]~"(adjusted p-value)"),
+       title = "Volcano plot — Treatment vs Control",
+       color = "Expression") +
+  theme_bw(base_size = 13)
+```
+
+### 7.4 Density Ridgeline Plot
+
+```{r plot-ridgeline, fig.height=6}
+# ── Ridgeline: ΔCt distribution per gene, coloured by Group ──────────────────
+# Select the 10 most significant genes for readability
+top10 <- anova_group$Gene[1:10]
+
+dct_long_plot %>%
+  filter(Gene %in% top10) %>%
+  ggplot(aes(x = dCt, y = Gene, fill = Group)) +
+  geom_density_ridges(alpha = 0.55, scale = 1.2,
+                      rel_min_height = 0.01) +
+  scale_fill_manual(values = c("Control" = "#1E8449", "Treatment" = "#C0392B")) +
+  labs(x = "ΔCt", y = NULL,
+       title = "ΔCt distribution — top 10 significant genes",
+       subtitle = "Ridgeline density by Group") +
+  theme_ridges(base_size = 12) +
+  theme(legend.position = "top")
+```
+
+### 7.5 Heatmap-Style Tile Plot
+
+```{r plot-heatmap, fig.height=6}
+# ── Mean ΔCt heatmap: Gene × Group × Tissue ───────────────────────────────────
+heatmap_df <- dct_long_plot %>%
+  group_by(Gene, Group, Tissue) %>%
+  summarise(mean_dCt = mean(dCt), .groups = "drop") %>%
+  mutate(condition = paste0(Group, "\n", Tissue))
+
+ggplot(heatmap_df, aes(x = condition, y = Gene, fill = mean_dCt)) +
+  geom_tile(color = "white", linewidth = 0.4) +
+  scale_fill_gradient2(
+    low      = "#C0392B",
+    mid      = "#F9F9F9",
+    high     = "#1565AC",
+    midpoint = median(heatmap_df$mean_dCt),
+    name     = "Mean ΔCt"
+  ) +
+  labs(x = "Condition", y = "Gene",
+       title = "Mean ΔCt heatmap",
+       subtitle = "Red = high expression (low ΔCt), Blue = low expression") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(face = "bold"),
+        panel.grid  = element_blank())
+```
+
+---
+
+## 8. PCA of Gene Expression
+
+PCA summarises the 20-gene expression profiles of each sample into a
+low-dimensional space. Samples clustering by Group or Tissue confirm that
+the gene panel captures relevant biological variation.
+
+```{r pca, fig.height=5}
+# ── PCA input: samples × genes (ΔCt matrix) ───────────────────────────────────
+pca_matrix <- delta_ct %>%
+  select(all_of(target_genes)) %>%
+  as.data.frame()
+
+rownames(pca_matrix) <- paste0(delta_ct$Sample_ID, "_",
+                               delta_ct$Group, "_", delta_ct$Tissue)
+
+pca_result <- PCA(pca_matrix, scale.unit = TRUE, ncp = 10, graph = FALSE)
+
+# ── Scree plot ────────────────────────────────────────────────────────────────
+p_scree <- fviz_eig(pca_result, addlabels = TRUE, ncp = 10,
+                    ggtheme = theme_minimal(),
+                    title   = "Scree plot — variance explained per PC")
+
+# ── Sample map coloured by Group ──────────────────────────────────────────────
+group_col <- delta_ct$Group
+
+p_ind <- fviz_pca_ind(
+  pca_result,
+  geom.ind    = "point",
+  col.ind     = group_col,
+  palette     = c("Control" = "#1E8449", "Treatment" = "#C0392B"),
+  addEllipses = TRUE,
+  ellipse.type = "confidence",
+  repel       = TRUE,
+  legend.title = "Group",
+  title        = "PCA — samples coloured by Group"
+)
+
+p_scree + p_ind
+```
+
+```{r pca-tissue, fig.height=5}
+# ── Sample map coloured by Tissue ─────────────────────────────────────────────
+tissue_col <- delta_ct$Tissue
+
+p_tissue <- fviz_pca_ind(
+  pca_result,
+  geom.ind    = "point",
+  col.ind     = tissue_col,
+  palette     = c("TypeA" = "#1565AC", "TypeB" = "#E65100"),
+  addEllipses = TRUE,
+  ellipse.type = "confidence",
+  repel        = TRUE,
+  legend.title = "Tissue",
+  title        = "PCA — samples coloured by Tissue"
+)
+
+# ── Variable (gene) map ───────────────────────────────────────────────────────
+p_var <- fviz_pca_var(
+  pca_result,
+  col.var    = "contrib",
+  gradient.cols = c("#74C476", "#005A32"),
+  repel      = TRUE,
+  title      = "PCA variable map — gene contributions"
+)
+
+p_tissue + p_var
+```
+
+```{r pca-contrib, fig.height=4}
+# ── Top gene contributions to PC1 and PC2 ────────────────────────────────────
+p_c1 <- fviz_contrib(pca_result, choice = "var", axes = 1, top = 10) +
+  ggtitle("Gene contributions — PC1")
+p_c2 <- fviz_contrib(pca_result, choice = "var", axes = 2, top = 10) +
+  ggtitle("Gene contributions — PC2")
+
+p_c1 + p_c2
+```
+
+---
+
+## 9. Export Results
+
+```{r export}
+dir.create("results", showWarnings = FALSE)
+
+# ΔCt normalized data
+write.csv(delta_ct,       "results/delta_ct_normalized.csv",  row.names = FALSE)
+
+# ΔΔCt and fold change
+write.csv(ddct_long,      "results/ddct_fold_change.csv",     row.names = FALSE)
+
+# ANOVA results
+write.csv(anova_group,    "results/anova_group_effect.csv",   row.names = FALSE)
+write.csv(anova_interaction, "results/anova_interaction.csv", row.names = FALSE)
+
+# Fold change summary
+write.csv(fc_summary,     "results/fold_change_summary.csv",  row.names = FALSE)
+
+cat("Results exported to results/\n")
+```
+
+---
+
+## 10. Session Info
+
+```{r session}
+sessionInfo()
+```
+
+---
+
+## Key Formulas Reference
+
+$$\Delta Ct = Ct_{target} - Ct_{housekeeping}$$
+
+$$\Delta \Delta Ct = \Delta Ct_{sample} - \Delta Ct_{calibrator}$$
+
+$$\text{Fold Change} = 2^{-\Delta\Delta Ct}$$
+
+**Interpretation guide:**
+
+| ΔCt | Expression level |
+|---|---|
+| Low (e.g. 2–5) | High expression |
+| Medium (e.g. 8–12) | Moderate expression |
+| High (e.g. >15) | Low / absent expression |
+
+---
+
+*This tutorial uses simulated data. Adapt the simulation parameters in
+Section 2 to match your own experimental design.*
