@@ -1,7 +1,7 @@
 ---
 title: "From Raw Ct to Insights: A qPCR Analysis Tutorial in R"
-author: "[Your Name]"
-date: "`r Sys.Date()`"
+author: "Hamed Abdollahi"
+date: "`2026-04-25"
 output:
   html_document:
     toc: true
